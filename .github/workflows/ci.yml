@@ -33,7 +33,9 @@ jobs:
 
       - name: Install platform tray deps (Linux)
         if: runner.os == 'Linux'
-        run: pip install python-xlib
+        run: |
+          pip install python-xlib
+          sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Build fixture DB
         run: python tests/make_fixture.py
@@ -47,10 +49,17 @@ jobs:
           KIRO_DB_PATH: tests/fixtures/state.vscdb
         run: python kiro_usage_widget.py --selftest
 
-      - name: Import widget + tray backend (smoke)
+      - name: Import widget core (smoke, headless)
+        run: python -c "import kiro_usage_widget as w; print('module ok on', __import__('sys').platform); print(w.make_icon(50).size)"
+
+      - name: Import tray backend (smoke)
+        shell: bash
         run: |
-          python -c "import kiro_usage_widget as w; print('module ok on', __import__('sys').platform)"
-          python -c "import pystray; print('pystray', getattr(pystray,'__version__','?'))"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python -c "import pystray; print('pystray ok (xvfb)')"
+          else
+            python -c "import pystray; print('pystray', getattr(pystray,'__version__','?'))"
+          fi
 
       # On the real Mac runner, confirm the osascript command builders + the
       # macOS pystray Icon construct without raising (no display needed).
@@ -58,11 +67,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           python -c "
-          import kiro_usage_widget as w
+          import pystray, kiro_usage_widget as w
           u={'used':1900.0,'limit':2000.0,'pct':95.0,'reset':'2026-07-01','overages':0}
           print(w.usage_detail_text(u))
-          # build (don't run) an Icon via the Darwin backend
-          ic = w.pystray.Icon('t', icon=w.make_icon(95), title=w.tooltip(u))
+          ic = pystray.Icon('t', icon=w.make_icon(95), title=w.tooltip(u))
           print('mac Icon constructed:', ic.name)
           "
 

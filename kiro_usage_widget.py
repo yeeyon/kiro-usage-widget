@@ -26,7 +26,12 @@ import subprocess
 
 from PIL import Image, ImageDraw
 
-import pystray
+# pystray is imported lazily (see _pystray) — importing it eagerly tries to
+# open an X display, which fails on headless Linux/CI. The core (usage read +
+# gauge render) must work without any display.
+def _pystray():
+    import pystray
+    return pystray
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -306,6 +311,7 @@ class WinApp:
         self.ui_q = queue.Queue()          # poll thread -> main(Tk) thread
         self.root = tk.Tk()
         self.root.withdraw()                # hidden root; only dialogs show
+        pystray = _pystray()
         self.icon = pystray.Icon(
             "kiro_usage",
             icon=make_icon(0),
@@ -390,6 +396,7 @@ class MacApp:
     daemon thread; alerts/details use native osascript dialogs."""
     def __init__(self):
         self.latest = None
+        pystray = _pystray()
         self.icon = pystray.Icon(
             "kiro_usage",
             icon=make_icon(0),
