@@ -1,0 +1,20 @@
+# local runtime state (per-machine, not for sharing)
+alert_state.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# os / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# scratch
+preview_*.png
+*.log
