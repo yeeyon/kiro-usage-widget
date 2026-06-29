@@ -1,12 +1,16 @@
 """
 Kiro Usage Widget
 -----------------
-System-tray widget that watches Kiro Pro+ credit usage, shows a live gauge in
-the taskbar, and pops a custom dialog when usage crosses the 50% and 90% marks.
+Cross-platform system-tray / menu-bar widget that watches Kiro Pro+ credit
+usage, shows a live gauge, and alerts when usage crosses the 50% and 90% marks.
 
-Data source (live, same numbers as the IDE status bar):
-  %APPDATA%\\Kiro\\User\\globalStorage\\state.vscdb  (SQLite)
+Data source (live, same numbers as the IDE status bar) — Kiro's local SQLite:
+  Windows : %APPDATA%\\Kiro\\User\\globalStorage\\state.vscdb
+  macOS   : ~/Library/Application Support/Kiro/User/globalStorage/state.vscdb
+  Linux   : ~/.config/Kiro/User/globalStorage/state.vscdb
   key 'kiro.kiroAgent' -> kiro.resourceNotifications.usageState
+
+Override the path for testing with the KIRO_DB_PATH environment variable.
 """
 
 import os
@@ -14,19 +18,43 @@ import sys
 import json
 import math
 import time
+import shlex
 import queue
 import sqlite3
 import threading
+import subprocess
 
-import tkinter as tk
-from tkinter import font as tkfont
+from PIL import Image, ImageDraw
 
-from PIL import Image, ImageDraw, ImageTk
 import pystray
 
-# ---------------------------------------------------------------- config
-APPDATA = os.environ.get("APPDATA", "")
-DB_PATH = os.path.join(APPDATA, "Kiro", "User", "globalStorage", "state.vscdb")
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
+# Tkinter is only used for the Windows dialog; import lazily so the module
+# loads on headless/macOS CI where the custom Tk dialog isn't used.
+if IS_WIN:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from PIL import ImageTk
+
+# ---------------------------------------------------------------- paths
+def default_db_path():
+    """Locate Kiro's usage SQLite DB for the current OS.
+    KIRO_DB_PATH overrides everything (used by tests/CI)."""
+    override = os.environ.get("KIRO_DB_PATH")
+    if override:
+        return override
+    if IS_WIN:
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif IS_MAC:
+        base = os.path.expanduser("~/Library/Application Support")
+    else:  # linux / other
+        base = os.environ.get(
+            "XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    return os.path.join(base, "Kiro", "User", "globalStorage", "state.vscdb")
+
+DB_PATH = default_db_path()
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "alert_state.json")
 
@@ -46,10 +74,11 @@ def zone_color(pct):
     return ROSE if pct >= 90 else AMBER if pct >= 50 else EMERALD
 
 # ---------------------------------------------------------------- usage read
-def read_usage():
+def read_usage(db_path=None):
     """Read live usage. Opens read-only (NOT immutable) so Kiro's ongoing
     writes / WAL are always reflected."""
-    uri = f"file:{DB_PATH}?mode=ro"
+    path = db_path or DB_PATH
+    uri = f"file:{path}?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=3)
     try:
         con.execute("PRAGMA busy_timeout=3000")
@@ -120,9 +149,39 @@ def make_gauge(pct, S, width_frac=0.16, pad_frac=0.13, track="#ffffff", track_a=
 def make_icon(pct):
     return make_gauge(pct, 64)
 
-# ---------------------------------------------------------------- custom dialog
-class Dialog(tk.Toplevel):
-    """Borderless dark card matching the gauge aesthetic (no OS title bar)."""
+# ---------------------------------------------------------------- macOS alerts
+def _osascript(script):
+    """Run an AppleScript snippet, detached, so it never blocks polling."""
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def mac_notify(title, text):
+    """Passive Notification Center banner."""
+    q = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    _osascript(f'display notification "{q(text)}" with title "{q(title)}"')
+
+def mac_dialog(title, text):
+    """Modal native dialog the user must dismiss (no auto-timeout)."""
+    q = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    _osascript(
+        f'display dialog "{q(text)}" with title "{q(title)}" '
+        f'buttons {{"OK"}} default button "OK" with icon note giving up after 0'
+    )
+
+def usage_detail_text(u):
+    return (f"Used:       {u['used']:.2f}\n"
+            f"Limit:      {u['limit']:.0f}\n"
+            f"Remaining:  {u['limit'] - u['used']:.2f}\n"
+            f"Percent:    {u['pct']:.1f}%\n"
+            f"Overages:   {u['overages']}\n"
+            f"Resets:     {u['reset']}")
+
+# ---------------------------------------------------------------- Windows dialog
+class Dialog(tk.Toplevel if IS_WIN else object):
+    """Borderless dark card matching the gauge aesthetic (Windows only)."""
     def __init__(self, master, usage, heading, sub, accent):
         super().__init__(master)
         self.withdraw()
@@ -218,14 +277,35 @@ class Dialog(tk.Toplevel):
     def _close(self):
         self.destroy()
 
-# ---------------------------------------------------------------- app
-class Widget:
+# ---------------------------------------------------------------- shared logic
+def check_thresholds(u, on_fire):
+    """Fire-once-per-cycle threshold logic, shared by both platforms.
+    Calls on_fire(threshold) for each newly crossed mark."""
+    st = load_state()
+    if st.get("cycle") != u["reset"]:
+        st = {"cycle": u["reset"], "fired": []}
+    for t in THRESHOLDS:
+        if u["pct"] >= t and t not in st["fired"]:
+            st["fired"].append(t)
+            save_state(st)
+            on_fire(t)
+    save_state(st)
+
+def tooltip(u):
+    if not u:
+        return "Kiro usage: DB not found"
+    return (f"Kiro Pro+  {u['pct']:.1f}%\n"
+            f"{u['used']:.2f} / {u['limit']:.0f} credits\n"
+            f"resets {u['reset']}")
+
+# ---------------------------------------------------------------- Windows app
+class WinApp:
+    """Windows: pystray detached + Tk main thread for the custom gauge dialog."""
     def __init__(self):
         self.latest = None
         self.ui_q = queue.Queue()          # poll thread -> main(Tk) thread
         self.root = tk.Tk()
         self.root.withdraw()                # hidden root; only dialogs show
-
         self.icon = pystray.Icon(
             "kiro_usage",
             icon=make_icon(0),
@@ -238,48 +318,24 @@ class Widget:
             ),
         )
 
-    # ---- tooltip
-    def tooltip(self, u):
-        if not u:
-            return "Kiro usage: DB not found"
-        return (f"Kiro Pro+  {u['pct']:.1f}%\n"
-                f"{u['used']:.2f} / {u['limit']:.0f} credits\n"
-                f"resets {u['reset']}")
-
-    # ---- menu handlers (run in pystray thread -> marshal to Tk thread)
-    def _menu_details(self, icon, item):
-        self.ui_q.put(("details", None))
-
+    def _menu_details(self, icon, item): self.ui_q.put(("details", None))
     def _menu_check(self, icon, item):
-        self.poll(force=True)
-        self.ui_q.put(("details", None))
+        self.poll(force=True); self.ui_q.put(("details", None))
+    def _menu_quit(self, icon, item): self.ui_q.put(("quit", None))
 
-    def _menu_quit(self, icon, item):
-        self.ui_q.put(("quit", None))
-
-    # ---- polling (background thread)
     def poll(self, force=False):
         try:
             u = read_usage()
-        except Exception as e:
-            self.icon.title = f"Kiro usage: read error"
+        except Exception:
+            self.icon.title = "Kiro usage: read error"
             return
         self.latest = u
         if not u:
-            self.icon.title = self.tooltip(u)
+            self.icon.title = tooltip(u)
             return
         self.icon.icon = make_icon(u["pct"])
-        self.icon.title = self.tooltip(u)
-
-        st = load_state()
-        if st.get("cycle") != u["reset"]:
-            st = {"cycle": u["reset"], "fired": []}
-        for t in THRESHOLDS:
-            if u["pct"] >= t and t not in st["fired"]:
-                st["fired"].append(t)
-                save_state(st)
-                self.ui_q.put(("alert", t))
-        save_state(st)
+        self.icon.title = tooltip(u)
+        check_thresholds(u, lambda t: self.ui_q.put(("alert", t)))
 
     def loop(self):
         time.sleep(1.5)
@@ -287,15 +343,12 @@ class Widget:
             self.poll()
             time.sleep(POLL_SECONDS)
 
-    # ---- Tk-thread UI pump
     def pump(self):
         try:
             while True:
                 kind, arg = self.ui_q.get_nowait()
                 if kind == "quit":
-                    self.icon.stop()
-                    self.root.quit()
-                    return
+                    self.icon.stop(); self.root.quit(); return
                 elif kind == "details":
                     self.show_details()
                 elif kind == "alert":
@@ -306,11 +359,10 @@ class Widget:
 
     def show_details(self):
         u = self.latest
-        if not u:
-            return
-        Dialog(self.root, u, "Kiro Pro+ usage",
-               "Live credit usage for this billing cycle.",
-               zone_color(u["pct"]))
+        if u:
+            Dialog(self.root, u, "Kiro Pro+ usage",
+                   "Live credit usage for this billing cycle.",
+                   zone_color(u["pct"]))
 
     def show_alert(self, t):
         u = self.latest
@@ -332,29 +384,120 @@ class Widget:
         self.root.after(200, self.pump)
         self.root.mainloop()
 
+# ---------------------------------------------------------------- macOS app
+class MacApp:
+    """macOS: pystray must own the MAIN thread (AppKit). Polling runs on a
+    daemon thread; alerts/details use native osascript dialogs."""
+    def __init__(self):
+        self.latest = None
+        self.icon = pystray.Icon(
+            "kiro_usage",
+            icon=make_icon(0),
+            title="Kiro usage: loading...",
+            menu=pystray.Menu(
+                pystray.MenuItem("Usage details", self._menu_details, default=True),
+                pystray.MenuItem("Check now", self._menu_check),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", self._menu_quit),
+            ),
+        )
 
-if __name__ == "__main__":
-    # --selftest: used by setup to verify usage can be read, without launching
-    # the tray. Prints a one-line summary and exits 0 on success, 1 on failure.
-    if "--selftest" in sys.argv:
-        if not os.path.exists(DB_PATH):
-            print(f"Kiro DB not found at {DB_PATH}")
-            sys.exit(1)
+    def _menu_details(self, icon, item): self._show_details()
+    def _menu_check(self, icon, item):
+        self.poll(force=True); self._show_details()
+    def _menu_quit(self, icon, item): self.icon.stop()
+
+    def _show_details(self):
+        u = self.latest
+        if u:
+            mac_dialog("Kiro Pro+ usage", usage_detail_text(u))
+
+    def poll(self, force=False):
         try:
             u = read_usage()
-        except Exception as e:
-            print(f"read error: {e}")
-            sys.exit(1)
+        except Exception:
+            self.icon.title = "Kiro usage: read error"
+            return
+        self.latest = u
         if not u:
-            print("usage data not present yet (sign in to Kiro)")
-            sys.exit(1)
-        print(f"{u['used']:.2f}/{u['limit']:.0f} credits ({u['pct']:.1f}%)")
-        sys.exit(0)
+            self.icon.title = tooltip(u)
+            return
+        self.icon.icon = make_icon(u["pct"])
+        self.icon.title = tooltip(u)
+        check_thresholds(u, self._alert)
+
+    def _alert(self, t):
+        u = self.latest
+        danger = t >= 90
+        head = f"Kiro usage at {t}%" + (" — almost out!" if danger else "")
+        body = (f"You've used {u['pct']:.1f}% of your Kiro Pro+ credits. "
+                f"Resets {u['reset']}.")
+        mac_notify(head, body)   # passive banner
+        mac_dialog(head, body)   # modal, must dismiss
+
+    def loop(self):
+        time.sleep(1.5)
+        while True:
+            self.poll()
+            time.sleep(POLL_SECONDS)
+
+    def run(self):
+        threading.Thread(target=self.loop, daemon=True).start()
+        self.icon.run()          # MUST be on the main thread on macOS
+
+# ---------------------------------------------------------------- entrypoint
+def run_selftest():
+    if not os.path.exists(DB_PATH):
+        print(f"Kiro DB not found at {DB_PATH}"); return 1
+    try:
+        u = read_usage()
+    except Exception as e:
+        print(f"read error: {e}"); return 1
+    if not u:
+        print("usage data not present yet (sign in to Kiro)"); return 1
+    print(f"{u['used']:.2f}/{u['limit']:.0f} credits ({u['pct']:.1f}%)")
+    return 0
+
+def run_screenshot(outdir):
+    """Render the tray icon + a dialog mock to PNGs (used by CI artifacts)."""
+    os.makedirs(outdir, exist_ok=True)
+    for p in (14, 65, 95):
+        make_icon(p).save(os.path.join(outdir, f"icon_{p}.png"))
+    # gauge-states strip
+    strip = Image.new("RGBA", (460, 150), (24, 24, 28, 255))
+    x = 80
+    for p in (14, 65, 95):
+        g = make_gauge(p, 72)
+        strip.alpha_composite(g, (x - 36, 24)); x += 150
+    strip.save(os.path.join(outdir, "states.png"))
+    print(f"screenshots written to {outdir}")
+    return 0
+
+def main():
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())
+    if "--screenshot" in sys.argv:
+        i = sys.argv.index("--screenshot")
+        outdir = sys.argv[i + 1] if len(sys.argv) > i + 1 else "docs"
+        sys.exit(run_screenshot(outdir))
 
     if not os.path.exists(DB_PATH):
-        r = tk.Tk(); r.withdraw()
-        from tkinter import messagebox
-        messagebox.showerror("Kiro usage widget",
-                             f"Kiro usage DB not found:\n{DB_PATH}")
+        msg = f"Kiro usage DB not found:\n{DB_PATH}"
+        if IS_WIN:
+            r = tk.Tk(); r.withdraw()
+            from tkinter import messagebox
+            messagebox.showerror("Kiro usage widget", msg)
+        elif IS_MAC:
+            mac_dialog("Kiro usage widget", msg)
+        else:
+            print(msg)
         sys.exit(1)
-    Widget().run()
+
+    if IS_MAC:
+        MacApp().run()
+    else:
+        WinApp().run()
+
+
+if __name__ == "__main__":
+    main()

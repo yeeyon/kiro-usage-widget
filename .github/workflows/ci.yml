@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      # pystray's macOS backend needs pyobjc; Linux backends need Xlib.
+      - name: Install platform tray deps (macOS)
+        if: runner.os == 'macOS'
+        run: pip install pyobjc-framework-Cocoa pyobjc-framework-Quartz
+
+      - name: Install platform tray deps (Linux)
+        if: runner.os == 'Linux'
+        run: pip install python-xlib
+
+      - name: Build fixture DB
+        run: python tests/make_fixture.py
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      - name: Selftest against fixture
+        shell: bash
+        env:
+          KIRO_DB_PATH: tests/fixtures/state.vscdb
+        run: python kiro_usage_widget.py --selftest
+
+      - name: Import widget + tray backend (smoke)
+        run: |
+          python -c "import kiro_usage_widget as w; print('module ok on', __import__('sys').platform)"
+          python -c "import pystray; print('pystray', getattr(pystray,'__version__','?'))"
+
+      # On the real Mac runner, confirm the osascript command builders + the
+      # macOS pystray Icon construct without raising (no display needed).
+      - name: macOS osascript + Icon smoke
+        if: runner.os == 'macOS'
+        run: |
+          python -c "
+          import kiro_usage_widget as w
+          u={'used':1900.0,'limit':2000.0,'pct':95.0,'reset':'2026-07-01','overages':0}
+          print(w.usage_detail_text(u))
+          # build (don't run) an Icon via the Darwin backend
+          ic = w.pystray.Icon('t', icon=w.make_icon(95), title=w.tooltip(u))
+          print('mac Icon constructed:', ic.name)
+          "
+
+      - name: Render screenshots (visual artifacts)
+        run: python kiro_usage_widget.py --screenshot artifacts
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: gauges-${{ matrix.os }}
+          path: artifacts/*.png
+          if-no-files-found: error

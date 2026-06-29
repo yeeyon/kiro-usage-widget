@@ -18,3 +18,5 @@ desktop.ini
 # scratch
 preview_*.png
 *.log
+artifacts/
+.pytest_cache/
