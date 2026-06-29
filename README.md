@@ -4,6 +4,17 @@ A tiny Windows system-tray widget that shows your **Kiro Pro+ credit usage** as 
 live gauge and pops a clean dialog when you cross the **50%** and **90%** marks —
 so you never get surprised by overage charges.
 
+<p align="center">
+  <img src="docs/dialog.png" alt="Kiro Usage Widget dialog" width="380">
+</p>
+
+The tray gauge shifts color as credits burn — green while healthy, amber as you
+approach your limit, red when you're nearly out:
+
+<p align="center">
+  <img src="docs/states.png" alt="Gauge states: healthy, watch, alert" width="440">
+</p>
+
 - 🎯 Live gauge in the taskbar — color shifts green → amber → red as credits burn
 - 🔔 One alert per threshold per billing cycle (no nagging)
 - 🪟 Borderless dark popup, dismiss with OK / Esc / Enter
