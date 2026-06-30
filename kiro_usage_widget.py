@@ -284,6 +284,16 @@ def mac_dialog_buttons(title, text, buttons, default):
     """Blocking native dialog with custom buttons. Returns the clicked button
     label, or None if dismissed/errored. Runs osascript synchronously, so the
     caller must be off the AppKit main thread."""
+    proc = mac_dialog_async(title, text, buttons, default)
+    if proc is None:
+        return None
+    proc.wait()
+    return mac_dialog_choice(proc)
+
+def mac_dialog_async(title, text, buttons, default):
+    """Non-blocking native dialog. Returns the Popen handle so the caller can
+    wait on it, poll it, or terminate() it to swap in fresh content while it's
+    open. Parse the clicked button with mac_dialog_choice once it exits."""
     q = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
     btns = "{" + ", ".join(f'"{q(b)}"' for b in buttons) + "}"
     script = (
@@ -291,19 +301,31 @@ def mac_dialog_buttons(title, text, buttons, default):
         f'buttons {btns} default button "{q(default)}" with icon note'
     )
     try:
-        out = subprocess.run(
+        return subprocess.Popen(
             ["osascript", "-e", script],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
     except Exception:
         return None
-    if out.returncode != 0:        # user pressed Esc / closed the dialog
+
+def mac_dialog_choice(proc):
+    """Parse the clicked button from a finished mac_dialog_async process.
+    Returns None if it was dismissed, errored, or terminated."""
+    try:
+        out, _ = proc.communicate()
+    except Exception:
         return None
-    # osascript prints e.g. "button returned:Refresh"
-    line = out.stdout.strip()
+    if proc.returncode != 0:        # user pressed Esc, or we terminated it
+        return None
+    line = (out or "").strip()      # osascript prints e.g. "button returned:Refresh"
     if "button returned:" in line:
         return line.split("button returned:", 1)[1].strip()
     return None
+
+def _usage_key(u):
+    """Identity of the *meaningful* usage data, ignoring the timestamp, so the
+    macOS dialog only re-renders when the numbers actually change."""
+    return (u["used"], u["limit"], u["overages"], u["reset"], u.get("source"))
 
 def usage_detail_text(u, updated=""):
     lines = [f"Used:       {u['used']:.2f}",
@@ -320,10 +342,11 @@ def usage_detail_text(u, updated=""):
 class Dialog(tk.Toplevel if IS_WIN else object):
     """Borderless dark card matching the gauge aesthetic (Windows only)."""
     def __init__(self, master, usage, heading, sub, accent,
-                 updated="", on_refresh=None):
+                 updated="", on_refresh=None, on_close=None):
         super().__init__(master)
         self.withdraw()
         self._on_refresh = on_refresh
+        self._on_close = on_close
         self.configure(bg=BG)
         self.resizable(False, False)
         self.overrideredirect(True)          # no title bar / window chrome
@@ -455,6 +478,8 @@ class Dialog(tk.Toplevel if IS_WIN else object):
         self.geometry(f"+{sw - w - 24}+{sh - h - 70}")
 
     def _close(self):
+        if self._on_close is not None:
+            self._on_close()
         self.destroy()
 
 # ---------------------------------------------------------------- shared logic
@@ -479,12 +504,28 @@ def tooltip(u):
             f"{u['used']:.2f} / {u['limit']:.0f} credits\n"
             f"resets {u['reset']}")
 
+def sleep_until_next_poll(secs=POLL_SECONDS):
+    """Sleep ~secs, but in short slices, and return early if the wall clock
+    jumped — that means the machine was suspended/hibernated, so the caller
+    should poll immediately on wake instead of waiting out the old timer."""
+    deadline = time.monotonic() + secs
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return                       # normal: full interval elapsed
+        before = time.monotonic()
+        time.sleep(min(2.0, remaining))
+        # if a 2s nap took much longer in real time, we just woke from sleep
+        if time.monotonic() - before > 10:
+            return
+
 # ---------------------------------------------------------------- Windows app
 class WinApp:
     """Windows: pystray detached + Tk main thread for the custom gauge dialog."""
     def __init__(self):
         self.latest = None
         self.last_update = ""
+        self.dialog = None                 # the open details Dialog, if any
         self.ui_q = queue.Queue()          # poll thread -> main(Tk) thread
         self.root = tk.Tk()
         self.root.withdraw()                # hidden root; only dialogs show
@@ -520,13 +561,14 @@ class WinApp:
             " (cached)" if u.get("source") == "cached" else "")
         self.icon.icon = make_icon(u["pct"])
         self.icon.title = tooltip(u)
+        self.ui_q.put(("live", None))      # push fresh data into an open dialog
         check_thresholds(u, lambda t: self.ui_q.put(("alert", t)))
 
     def loop(self):
         time.sleep(1.5)
         while True:
             self.poll()
-            time.sleep(POLL_SECONDS)
+            sleep_until_next_poll()
 
     def pump(self):
         try:
@@ -536,19 +578,36 @@ class WinApp:
                     self.icon.stop(); self.root.quit(); return
                 elif kind == "details":
                     self.show_details()
+                elif kind == "live":
+                    self._push_live()
                 elif kind == "alert":
                     self.show_alert(arg)
         except queue.Empty:
             pass
         self.root.after(200, self.pump)
 
+    def _push_live(self):
+        """Feed the latest poll into the open dialog so it updates in place."""
+        d = self.dialog
+        if d is not None and d.winfo_exists() and self.latest:
+            d._set_usage(self.latest, self.last_update)
+
     def show_details(self):
         u = self.latest
-        if u:
-            Dialog(self.root, u, "Kiro Pro+ usage",
-                   "Live credit usage for this billing cycle.",
-                   zone_color(u["pct"]),
-                   updated=self.last_update, on_refresh=self._refresh_now)
+        if not u:
+            return
+        if self.dialog is not None and self.dialog.winfo_exists():
+            self.dialog._set_usage(u, self.last_update)   # already open: just lift
+            self.dialog.lift(); self.dialog.focus_force()
+            return
+        self.dialog = Dialog(self.root, u, "Kiro Pro+ usage",
+                             "Live credit usage for this billing cycle.",
+                             zone_color(u["pct"]),
+                             updated=self.last_update, on_refresh=self._refresh_now,
+                             on_close=self._details_closed)
+
+    def _details_closed(self):
+        self.dialog = None
 
     def _refresh_now(self):
         """Called from the Refresh button (Tk main thread): re-read the DB
@@ -616,14 +675,26 @@ class MacApp:
                 u = self.latest
                 if not u:
                     return
-                choice = mac_dialog_buttons(
+                shown_key = _usage_key(u)
+                proc = mac_dialog_async(
                     "Kiro Pro+ usage",
                     usage_detail_text(u, self.last_update),
                     buttons=["Refresh", "OK"], default="OK")
-                if choice == "Refresh":
-                    self.poll(force=True)
-                    continue
-                return
+                if proc is None:
+                    return
+                # Wait for the user, but if a poll brings new numbers, close
+                # this dialog and reopen it with the fresh data (live update).
+                while proc.poll() is None:
+                    cur = self.latest
+                    if cur and _usage_key(cur) != shown_key:
+                        proc.terminate()
+                        break
+                    time.sleep(0.4)
+                else:
+                    if mac_dialog_choice(proc) == "Refresh":
+                        self.poll(force=True)
+                    return                       # OK / dismissed -> close
+                proc.wait()                      # reap the terminated dialog
         finally:
             self._details_open = False
 
@@ -656,7 +727,7 @@ class MacApp:
         time.sleep(1.5)
         while True:
             self.poll()
-            time.sleep(POLL_SECONDS)
+            sleep_until_next_poll()
 
     def run(self):
         threading.Thread(target=self.loop, daemon=True).start()
