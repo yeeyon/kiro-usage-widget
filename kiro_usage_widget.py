@@ -17,9 +17,16 @@ Data sources, in priority order:
        Linux   : ~/.config/Kiro/User/globalStorage/state.vscdb
        key 'kiro.kiroAgent' -> kiro.resourceNotifications.usageState
 
+The live token expires (~hours) and is only refreshed while Kiro runs, so the
+first read of the day would otherwise fall back to CACHED. To avoid that, when
+the cached access token is expired/near-expiry we mint a fresh one via the
+SSO-OIDC refresh-token grant (using refreshToken + the clientId/clientSecret in
+<sso cache>/<clientIdHash>.json) and write it back, exactly as the AWS SDK does.
+
 Override the DB path for testing with KIRO_DB_PATH (this also forces the cached
 path and skips the live call, keeping tests deterministic/offline). Set
-KIRO_NO_LIVE=1 to disable the live API without touching the DB path.
+KIRO_NO_LIVE=1 to disable the live API without touching the DB path, or
+KIRO_NO_REFRESH=1 to keep the live API but never refresh the token.
 """
 
 import os
@@ -34,6 +41,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+from datetime import datetime
 
 from PIL import Image, ImageDraw
 
@@ -83,6 +91,100 @@ def auth_token_path():
         return override
     return os.path.expanduser(
         os.path.join("~", ".aws", "sso", "cache", "kiro-auth-token.json"))
+
+def _registration_path(token, token_path):
+    """The SSO client-registration file (holds clientId/clientSecret), which
+    sits next to the token file, named <clientIdHash>.json."""
+    h = token.get("clientIdHash")
+    if not h:
+        return None
+    return os.path.join(os.path.dirname(token_path), f"{h}.json")
+
+def _parse_expiry(s):
+    """Parse an AWS SSO 'expiresAt' timestamp (ISO-8601, e.g.
+    '2026-07-02T02:39:04.326Z') to epoch seconds, or None if unparseable."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+REFRESH_SKEW = 300   # refresh if the token expires within this many seconds
+
+def _atomic_write_json(path, data):
+    """Write JSON, replacing the file atomically so a concurrent reader (a
+    running Kiro, or our next poll) never sees a half-written token."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+def _refresh_access_token(token, token_path):
+    """Mint a new access token from the SSO-OIDC refresh-token grant, using the
+    saved refreshToken + the clientId/clientSecret in the registration file.
+    On success, writes the updated token file and returns the new accessToken.
+    Returns None on any failure (caller then tries the existing token)."""
+    refresh = token.get("refreshToken")
+    region = token.get("region")
+    reg_path = _registration_path(token, token_path)
+    if not (refresh and region and reg_path):
+        return None
+    try:
+        with open(reg_path, encoding="utf-8") as f:
+            reg = json.load(f)
+        client_id, client_secret = reg["clientId"], reg["clientSecret"]
+    except Exception:
+        return None
+
+    body = json.dumps({
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "grantType": "refresh_token",
+        "refreshToken": refresh,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://oidc.{region}.amazonaws.com/token", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=LIVE_TIMEOUT) as r:
+            data = json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+    access = data.get("accessToken")
+    if not access:
+        return None
+    token["accessToken"] = access
+    if data.get("refreshToken"):          # rotated refresh token
+        token["refreshToken"] = data["refreshToken"]
+    if data.get("expiresIn"):
+        exp = time.gmtime(time.time() + data["expiresIn"])
+        token["expiresAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", exp)
+    try:
+        _atomic_write_json(token_path, token)
+    except Exception:
+        pass                              # still usable in-memory this cycle
+    return access
+
+def _access_token():
+    """Return a usable bearer token, refreshing it first if it's expired or
+    about to be. Falls back to whatever token is on disk (even if stale) so a
+    refresh outage still lets the live call try — and 401 there just triggers
+    the cached-SQLite fallback, same as before."""
+    path = auth_token_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            token = json.load(f)
+    except Exception:
+        return None
+    access = token.get("accessToken")
+    if os.environ.get("KIRO_NO_REFRESH"):
+        return access
+    exp = _parse_expiry(token.get("expiresAt"))
+    if access and exp is not None and exp > time.time() + REFRESH_SKEW:
+        return access                     # still fresh, no network needed
+    return _refresh_access_token(token, path) or access
 
 DB_PATH = default_db_path()
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -169,12 +271,10 @@ def read_usage_live(db_path=None):
     except IndexError:
         return None
 
-    # bearer token (re-read every call: any running Kiro process keeps it fresh)
-    try:
-        with open(auth_token_path(), encoding="utf-8") as f:
-            tok = json.load(f)
-        access = tok["accessToken"]
-    except Exception:
+    # bearer token: refreshed here if expired, so the first read of the day
+    # stays live instead of falling back to the (stale) cached SQLite value.
+    access = _access_token()
+    if not access:
         return None
 
     body = json.dumps({"profileArn": arn, "origin": "AI_EDITOR"}).encode()

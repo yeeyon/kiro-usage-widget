@@ -116,3 +116,72 @@ def test_screenshot_mode(widget, tmp_path):
     assert rc == 0
     for name in ("icon_14.png", "icon_65.png", "icon_95.png", "states.png"):
         assert (tmp_path / name).exists()
+
+
+# ---- token refresh -----------------------------------------------------
+import json as _json
+import time as _time
+
+
+def _write_token_pair(tmp_path, expires_at):
+    """Write a kiro-auth-token.json + its clientIdHash registration file,
+    mirroring the real AWS SSO cache layout."""
+    reg_hash = "deadbeef"
+    (tmp_path / f"{reg_hash}.json").write_text(_json.dumps(
+        {"clientId": "cid", "clientSecret": "secret", "expiresAt": expires_at}))
+    tok = tmp_path / "kiro-auth-token.json"
+    tok.write_text(_json.dumps({
+        "accessToken": "OLD", "refreshToken": "R1", "region": "ap-southeast-1",
+        "clientIdHash": reg_hash, "expiresAt": expires_at,
+    }))
+    return tok
+
+
+def test_parse_expiry(widget):
+    assert widget._parse_expiry("2026-07-02T02:39:04.326Z") is not None
+    assert widget._parse_expiry("") is None
+    assert widget._parse_expiry("not-a-date") is None
+
+
+def test_access_token_fresh_skips_network(widget, tmp_path, monkeypatch):
+    future = _time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                            _time.gmtime(_time.time() + 3600))
+    tok = _write_token_pair(tmp_path, future)
+    monkeypatch.setenv("KIRO_TOKEN_PATH", str(tok))
+    monkeypatch.setattr(widget.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not hit network")))
+    assert widget._access_token() == "OLD"
+
+
+def test_access_token_expired_refreshes_and_persists(widget, tmp_path, monkeypatch):
+    past = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 10))
+    tok = _write_token_pair(tmp_path, past)
+    monkeypatch.setenv("KIRO_TOKEN_PATH", str(tok))
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return _json.dumps({"accessToken": "NEW", "refreshToken": "R2",
+                                "expiresIn": 3600}).encode()
+
+    monkeypatch.setattr(widget.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp())
+    assert widget._access_token() == "NEW"
+    # rewritten to disk so the next poll / Kiro reuse the fresh token
+    saved = _json.loads(tok.read_text())
+    assert saved["accessToken"] == "NEW"
+    assert saved["refreshToken"] == "R2"
+
+
+def test_access_token_no_refresh_env(widget, tmp_path, monkeypatch):
+    past = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 10))
+    tok = _write_token_pair(tmp_path, past)
+    monkeypatch.setenv("KIRO_TOKEN_PATH", str(tok))
+    monkeypatch.setenv("KIRO_NO_REFRESH", "1")
+    monkeypatch.setattr(widget.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not hit network")))
+    assert widget._access_token() == "OLD"   # stale, but no refresh attempted
+
